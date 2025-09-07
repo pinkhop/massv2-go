@@ -3,6 +3,8 @@
 # https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
 
 name: Go
+permissions:
+  contents: read
 
 on:
   push:
