@@ -122,9 +122,7 @@ func TestMASSV2_BasicFunctionality(t *testing.T) {
 	// WHEN (operation under test)
 
 	actualDistances, err := MASSV2(timeSeries, query)
-
 	// THEN (assertions)
-
 	if err != nil {
 		t.Fatalf("MASSV2 failed: %v", err)
 	}
@@ -600,7 +598,6 @@ func TestSlidingMeanStddev(t *testing.T) {
 			}
 		})
 	}
-
 }
 
 // `go test -short ./...` to skip this test

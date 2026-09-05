@@ -5,9 +5,7 @@ import (
 	"slices"
 )
 
-var (
-	ErrKMustBePositive = errors.New("k must be a positive integer")
-)
+var ErrKMustBePositive = errors.New("k must be a positive integer")
 
 // FindBestMatch uses MASSV2 to identify the starting index of the subsequence
 // in the time-series that best matches the query. FindBestMatch returns the

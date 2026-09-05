@@ -177,7 +177,8 @@ func TestFindTopKMatches(t *testing.T) {
 				42, 82, 159, // starting at index 3, query *10 +1
 				15.1,
 				-6.67, 6.53, 31.94, // starting at index 7, query *3.3 -20.2
-				9.25, 1.2, 0.1},
+				9.25, 1.2, 0.1,
+			},
 			InputQuery:                   []float64{4.1, 8.1, 15.8},
 			InputK:                       2,
 			ExpectedIndices:              []int{3, 7},
