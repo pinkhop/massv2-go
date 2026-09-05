@@ -85,7 +85,7 @@ func MASSV2(timeSeries, query []float64) (distances []float64, err error) {
 
 	// Prepare the query for convolution: reverse the query
 	reversedQuery := make([]float64, m)
-	for i := 0; i < m; i++ {
+	for i := range m {
 		reversedQuery[i] = query[m-1-i]
 	}
 
@@ -136,17 +136,17 @@ func fftConvolutionLinear(signal, kernel []float64) ([]float64, error) {
 	a := make([]complex128, convLen)
 	b := make([]complex128, convLen)
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		a[i] = complex(signal[i], 0)
 	}
-	for i := 0; i < m; i++ {
+	for i := range m {
 		b[i] = complex(kernel[i], 0)
 	}
 
 	A := fft.Coefficients(nil, a)
 	B := fft.Coefficients(nil, b)
 
-	for i := 0; i < convLen; i++ {
+	for i := range convLen {
 		A[i] *= B[i]
 	}
 
@@ -154,7 +154,7 @@ func fftConvolutionLinear(signal, kernel []float64) ([]float64, error) {
 
 	out := make([]float64, n+m-1)
 	scale := float64(convLen) // gonum FFT is unnormalized
-	for i := 0; i < len(out); i++ {
+	for i := range out {
 		out[i] = real(c[i]) / scale
 	}
 	return out, nil
@@ -183,7 +183,7 @@ func slidingMeanStddev(data []float64, windowSize int) (means, sigmas []float64)
 
 	// Initialize the first window
 	var sum, sumOfSquares float64
-	for i := 0; i < windowSize; i++ {
+	for i := range windowSize {
 		sum += data[i]
 		sumOfSquares += data[i] * data[i]
 	}
