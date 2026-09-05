@@ -412,7 +412,7 @@ func TestMASSV2_Properties(t *testing.T) {
 	prng := newPRNG(seed...)
 
 	const numTests = 50
-	for i := 0; i < numTests; i++ {
+	for i := range numTests {
 		n := prng.IntN(500) + 100 // 100 to 600
 		m := prng.IntN(n/2) + 3   // 3 to n/2
 
