@@ -20,98 +20,86 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
 // IN THE SOFTWARE.
 
-package massv2
+package massv2_test
 
 import (
 	"errors"
 	"fmt"
 	"math"
-	"math/rand/v2"
+	"slices"
 	"testing"
-	"time"
 
 	"gonum.org/v1/gonum/stat"
+
+	massv2 "github.com/pinkhop/massv2-go"
+	"github.com/pinkhop/massv2-go/internal/testutil"
 )
 
-const floatToleranceForMASSV2Test = 2e-6
+// distanceProfileTestTolerance is the tolerance for comparing a distance
+// profile against an independent oracle. It independently pins the documented
+// target; passing confirms agreement for the tested fixtures only.
+const distanceProfileTestTolerance = 1e-7
 
-var (
-	defaultSeed0 uint64 = 0x7fa2_2276_889c_4782
-	defaultSeed1 uint64 = 0xaf4f_33b8_2757_b871
-)
-
-////////////////////////////////////////////////////////////////////////////////
-// BENCHMARKS
-
-func BenchmarkMASSV2_withMEqual200(b *testing.B) {
-	const queryLength = 200
-	sizes := []int{50_000, 100_000, 200_000}
-
-	for _, n := range sizes {
-		timeSeries := generateSyntheticData(n, 42)
-		query := generateSyntheticData(queryLength, 84)
-
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				_, err := MASSV2(timeSeries, query)
-				if err != nil {
-					b.Fatalf("MASSV2 failed: %v", err)
-				}
+func TestMASSV2_PlateauTransitions_MatchExactProfile(t *testing.T) {
+	t.Parallel()
+	for name, series := range map[string][]float64{
+		"plateaus":              {2, 2, 2, 2, 3, -1, 4, 4, 4, 4, 0, -2, -2, -2, -2},
+		"lost global variation": {1e300, 0, 0, 0, 1e-300, 2e-300, 3e-300, 0, 0, 0},
+		"extreme scratch reuse": {-math.MaxFloat64, 0, math.MaxFloat64, 0, 0, 0, math.SmallestNonzeroFloat64, 2 * math.SmallestNonzeroFloat64, 3 * math.SmallestNonzeroFloat64},
+		"signed zeros":          {0, math.Copysign(0, -1), 0, 1, 2, 0, 0, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			// GIVEN plateaus and nonconstant windows, with an independent reference.
+			query := []float64{1, 2, 3}
+			original := slices.Clone(series)
+			expected := testutil.ExactDistanceProfile(series, query)
+			// WHEN the complete public profile is computed.
+			actual, err := massv2.MASSV2(series, query)
+			// THEN constants remain infinite and all other distances agree.
+			if err != nil {
+				t.Fatal(err)
+			}
+			testutil.AssertDistanceProfilesEqual(t, actual, expected, err, 1e-7)
+			if !slices.Equal(series, original) || !slices.Equal(query, []float64{1, 2, 3}) {
+				t.Fatal("inputs were modified")
 			}
 		})
 	}
 }
 
-func BenchmarkMASSV2_withMEqual1000(b *testing.B) {
-	const queryLength = 1_000
-	sizes := []int{50_000, 100_000, 200_000}
-
-	for _, n := range sizes {
-		timeSeries := generateSyntheticData(n, 42)
-		query := generateSyntheticData(queryLength, 84)
-
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				_, err := MASSV2(timeSeries, query)
-				if err != nil {
-					b.Fatalf("MASSV2 failed: %v", err)
+func TestMASSV2_FallbackAllocations_DoNotGrowPerWindow(t *testing.T) {
+	// AllocsPerRun changes GOMAXPROCS, so this allocation test is not parallel.
+	for _, constant := range []bool{true, false} {
+		t.Run(fmt.Sprintf("constant=%t", constant), func(t *testing.T) {
+			// GIVEN either constant windows or exact ramp matches requiring fallback.
+			series := make([]float64, 2048)
+			if !constant {
+				for i := range series {
+					series[i] = float64(i)
 				}
+			}
+			query := []float64{1, 2, 3, 4, 5}
+			var calculationError error
+			// WHEN allocations are measured across calls with thousands of windows.
+			allocations := testing.AllocsPerRun(3, func() {
+				_, calculationError = massv2.MASSV2(series, query)
+			})
+			// THEN a generous fixed budget excludes a buffer allocation per window.
+			if calculationError != nil {
+				t.Fatal(calculationError)
+			}
+			if allocations > 100 {
+				t.Fatalf("got %.0f allocations; want at most 100", allocations)
 			}
 		})
 	}
 }
-
-func BenchmarkMASSV2_withMEqual5000(b *testing.B) {
-	const queryLength = 5_000
-	sizes := []int{50_000, 100_000, 200_000}
-
-	for _, n := range sizes {
-		timeSeries := generateSyntheticData(n, defaultSeed0, defaultSeed1)
-		query := generateSyntheticData(queryLength, defaultSeed0, defaultSeed1)
-
-		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
-			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				_, err := MASSV2(timeSeries, query)
-				if err != nil {
-					b.Fatalf("MASSV2 failed: %v", err)
-				}
-			}
-		})
-	}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// TESTS
 
 func TestMASSV2_BasicFunctionality(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
+	t.Parallel()
 
-	// GIVEN (set up)
-
-	// Simple test case with a known pattern
+	// GIVEN a simple series with a known exact occurrence of the query.
 	timeSeries := []float64{1.1, 1.9, 4.1, 8.1, 15.8, 15.1, 12.9, 9.25, 1.2, 0.1}
 	query := []float64{4.1, 8.1, 15.8}
 	const (
@@ -119,26 +107,22 @@ func TestMASSV2_BasicFunctionality(t *testing.T) {
 		expectedMotifIndex = 2
 	)
 
-	// WHEN (operation under test)
-
-	actualDistances, err := MASSV2(timeSeries, query)
-	// THEN (assertions)
+	// WHEN the public distance-profile API is called.
+	actualDistances, err := massv2.MASSV2(timeSeries, query)
+	// THEN the profile has one entry per window, no negative entries, and its
+	// minimum is the exact occurrence.
 	if err != nil {
 		t.Fatalf("MASSV2 failed: %v", err)
 	}
-
 	if len(actualDistances) != expectedLength {
 		t.Errorf("expected %d distances, got %d", expectedLength, len(actualDistances))
 	}
-
-	// All distances should be non-negative
 	for i, dist := range actualDistances {
-		if dist < 0 {
-			t.Errorf("found negative distance %f at index %d", dist, i)
+		if math.IsNaN(dist) || math.IsInf(dist, 0) || dist < 0 {
+			t.Errorf("expected finite nonnegative distance at index %d, got %v", i, dist)
 		}
 	}
 
-	// The perfect match should be at index 2 (subsequence [3,4,5])
 	minIdx := 0
 	minDist := actualDistances[0]
 	for i, dist := range actualDistances {
@@ -147,181 +131,211 @@ func TestMASSV2_BasicFunctionality(t *testing.T) {
 			minIdx = i
 		}
 	}
-
 	if minIdx != expectedMotifIndex {
 		t.Errorf("expected perfect match at index %d, got index %d with distance %f\ndistances=%#v", expectedMotifIndex, minIdx, minDist, actualDistances)
 	}
-
-	// The perfect match should have a distance very close to 0
-	if minDist > floatToleranceForMASSV2Test {
+	if !testutil.AlmostEqual(minDist, 0, distanceProfileTestTolerance) {
 		t.Errorf("expected perfect match distance to be very close to 0.0, got %e", minDist)
 	}
 }
 
 func TestMASSV2_SelfMatch(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
+	t.Parallel()
 
-	// Test with a query taken from the time series itself
-	timeSeries := generateSyntheticData(100, defaultSeed0, defaultSeed1)
+	// GIVEN a query copied from the series.
+	timeSeries := testutil.GenerateSyntheticData(100, testutil.DefaultSeed0, testutil.DefaultSeed1)
 	startIdx := 20
 	queryLength := 10
 	query := make([]float64, queryLength)
 	copy(query, timeSeries[startIdx:startIdx+queryLength])
 
-	distances, err := MASSV2(timeSeries, query)
+	// WHEN the public distance-profile API is called.
+	distances, err := massv2.MASSV2(timeSeries, query)
 	if err != nil {
 		t.Fatalf("MASSV2 failed: %v", err)
 	}
 
-	// The perfect match should be at startIdx
-	if !almostEqual(distances[startIdx], 0, floatToleranceForMASSV2Test) {
+	// THEN the copied window is an exact match.
+	if !testutil.AlmostEqual(distances[startIdx], 0, distanceProfileTestTolerance) {
 		t.Errorf("Self-match at index %d should have distance ~0, got %.12e", startIdx, distances[startIdx])
 	}
 }
 
 func TestMASSV2_IdenticalElements(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
+	t.Parallel()
 
-	// Test with repeated patterns
+	// GIVEN repeated shapes at several offsets and scales.
 	timeSeries := []float64{1, 2, 3, -3, -2, -1, 4, 5, 6, 12, 24}
 	query := []float64{1, 2, 3}
 
-	distances, err := MASSV2(timeSeries, query)
+	// WHEN the public distance-profile API is called.
+	distances, err := massv2.MASSV2(timeSeries, query)
 	if err != nil {
 		t.Fatalf("MASSV2 failed: %v", err)
 	}
 
-	// Should find perfect matches at indices 0, 3, 6
-	perfectMatches := []int{0, 3, 6}
-	for _, idx := range perfectMatches {
-		if !almostEqual(distances[idx], 0, floatToleranceForMASSV2Test) {
+	// THEN each repeated shape is an exact match.
+	for _, idx := range []int{0, 3, 6} {
+		if !testutil.AlmostEqual(distances[idx], 0, distanceProfileTestTolerance) {
 			t.Errorf("Expected perfect match at index %d, got distance %.12e", idx, distances[idx])
 		}
 	}
 }
 
 func TestMASSV2_ErrorCases(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
+	t.Parallel()
 
 	tests := []struct {
-		name       string
-		timeSeries []float64
-		query      []float64
-		expectErr  bool
+		name        string
+		timeSeries  []float64
+		query       []float64
+		expectedErr error
 	}{
 		{
-			name:       "Empty time series",
-			timeSeries: []float64{},
-			query:      []float64{1, 2, 3},
-			expectErr:  true,
+			name:        "Empty time series",
+			timeSeries:  []float64{},
+			query:       []float64{1, 2, 3},
+			expectedErr: massv2.ErrEmptyTimeSeries,
 		},
 		{
-			name:       "Empty query",
-			timeSeries: []float64{1, 2, 3, 4, 5},
-			query:      []float64{},
-			expectErr:  true,
+			name:        "Empty query",
+			timeSeries:  []float64{1, 2, 3, 4, 5},
+			query:       []float64{},
+			expectedErr: massv2.ErrEmptyQuery,
 		},
 		{
-			name:       "Query longer than time series",
-			timeSeries: []float64{1, 2, 3},
-			query:      []float64{1, 2, 3, 4, 5},
-			expectErr:  true,
+			name:        "Query longer than time series",
+			timeSeries:  []float64{1, 2, 3},
+			query:       []float64{1, 2, 3, 4, 5},
+			expectedErr: massv2.ErrQueryLongerThanTimeSeries,
 		},
 		{
-			name:       "Zero variance query",
-			timeSeries: []float64{1, 2, 3, 4, 5},
-			query:      []float64{2, 2, 2},
-			expectErr:  true,
+			name:        "Zero variance query",
+			timeSeries:  []float64{1, 2, 3, 4, 5},
+			query:       []float64{2, 2, 2},
+			expectedErr: massv2.ErrQueryHasZeroVariance,
 		},
 		{
 			name:       "Valid input",
 			timeSeries: []float64{1, 2, 3, 4, 5},
 			query:      []float64{2, 3, 4},
-			expectErr:  false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := MASSV2(tt.timeSeries, tt.query)
-			if (err != nil) != tt.expectErr {
-				t.Errorf("Expected error: %v, got error: %v", tt.expectErr, err != nil)
+			_, err := massv2.MASSV2(tt.timeSeries, tt.query)
+			if !errors.Is(err, tt.expectedErr) {
+				t.Errorf("expected error %v, got %v", tt.expectedErr, err)
 			}
 		})
 	}
 }
 
-func TestMASSV2_ZeroVarianceSubsequences(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
+func TestMASSV2_NonfiniteInputs_ReturnIdentifyingErrors(t *testing.T) {
+	t.Parallel()
 
-	// Time series with constant subsequences
-	timeSeries := []float64{1, 1, 1, 2, 3, 4, 5, 5, 5, 6}
-	query := []float64{2, 3, 4}
-
-	distances, err := MASSV2(timeSeries, query)
-	if err != nil {
-		t.Fatalf("MASSV2 failed: %v", err)
+	nonfiniteValues := map[string]float64{
+		"NaN":  math.NaN(),
+		"+Inf": math.Inf(1),
+		"-Inf": math.Inf(-1),
 	}
-
-	// Subsequences with zero variance should have infinite distance
-	// [1,1,1] at index 0, [5,5,5] at index 6
-	if !math.IsInf(distances[0], 1) {
-		t.Errorf("Expected infinite distance for zero variance subsequence at index 0, got %f", distances[0])
+	positions := map[string]func(length int) int{
+		"beginning": func(int) int { return 0 },
+		"middle":    func(length int) int { return length / 2 },
+		"end":       func(length int) int { return length - 1 },
 	}
-	if !math.IsInf(distances[6], 1) {
-		t.Errorf("Expected infinite distance for zero variance subsequence at index 6, got %f", distances[6])
-	}
+	baseSeries := []float64{7, 6, 1, 2, 4, 5, 3}
+	baseQuery := []float64{1, 2, 4}
 
-	// Perfect match should be at index 3
-	perfectMatchIdx := 3
-	if !almostEqual(distances[perfectMatchIdx], 0, floatToleranceForMASSV2Test) {
-		t.Errorf("Expected perfect match at index %d, got distance %f", perfectMatchIdx, distances[perfectMatchIdx])
+	for valueName, value := range nonfiniteValues {
+		for positionName, position := range positions {
+			t.Run(fmt.Sprintf("%s at %s of query", valueName, positionName), func(t *testing.T) {
+				t.Parallel()
+				query := slices.Clone(baseQuery)
+				query[position(len(query))] = value
+				assertAllPublicOperationsFail(t, baseSeries, query, massv2.ErrQueryNotFinite)
+			})
+			t.Run(fmt.Sprintf("%s at %s of time series", valueName, positionName), func(t *testing.T) {
+				t.Parallel()
+				timeSeries := slices.Clone(baseSeries)
+				timeSeries[position(len(timeSeries))] = value
+				assertAllPublicOperationsFail(t, timeSeries, baseQuery, massv2.ErrTimeSeriesNotFinite)
+			})
+		}
 	}
 }
 
+func TestMASSV2_ZeroVarianceSubsequences(t *testing.T) {
+	t.Parallel()
+
+	// GIVEN a series containing two constant windows and one exact match.
+	timeSeries := []float64{1, 1, 1, 2, 3, 4, 5, 5, 5, 6}
+	query := []float64{2, 3, 4}
+	expectedDistances := testutil.ExactDistanceProfile(timeSeries, query)
+
+	// WHEN the public distance-profile API is called.
+	actualDistances, err := massv2.MASSV2(timeSeries, query)
+
+	// THEN constant windows remain +Inf, and all other distances match the oracle.
+	testutil.AssertDistanceProfilesEqual(t, actualDistances, expectedDistances, err, distanceProfileTestTolerance)
+}
+
+func TestMASSV2_ConstantTimeSeries_ReturnsInfiniteProfile(t *testing.T) {
+	t.Parallel()
+
+	// GIVEN a constant series and a nonconstant query.
+	timeSeries := []float64{2, 2, 2, 2, 2}
+	query := []float64{1, 2, 4}
+
+	// WHEN the public distance-profile API is called.
+	actualDistances, err := massv2.MASSV2(timeSeries, query)
+
+	// THEN every window is +Inf and no error is returned.
+	testutil.AssertDistanceProfilesEqual(t, actualDistances, []float64{math.Inf(1), math.Inf(1), math.Inf(1)}, err, distanceProfileTestTolerance)
+}
+
 func TestMASSV2_SineWavePattern(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
+	t.Parallel()
 
-	// Generate sine wave and search for a pattern within it
+	// GIVEN a sine wave and a query cut from it.
 	const n = 1000
-	timeSeries := generateSineWave(n, 0.1, 1.0, 0)
-
-	// Extract a query from the sine wave
+	timeSeries := testutil.GenerateSineWave(n, 0.1, 1.0, 0)
 	queryStart := 100
 	queryLength := 50
 	query := timeSeries[queryStart : queryStart+queryLength]
 
-	distances, err := MASSV2(timeSeries, query)
+	// WHEN the public distance-profile API is called.
+	distances, err := massv2.MASSV2(timeSeries, query)
 	if err != nil {
 		t.Fatalf("MASSV2 failed: %v", err)
 	}
 
-	// Should find the perfect match at queryStart
-	if !almostEqual(distances[queryStart], 0, floatToleranceForMASSV2Test) {
+	// THEN the source window is an exact match and periodicity produces others.
+	if !testutil.AlmostEqual(distances[queryStart], 0, distanceProfileTestTolerance) {
 		t.Errorf("Expected perfect match at index %d, got distance %.12e", queryStart, distances[queryStart])
 	}
-
-	// Due to periodicity of sine wave, should find other good matches
 	goodMatches := 0
 	for _, dist := range distances {
-		if dist < 0.1 { // threshold for "good" match
+		if dist < 0.1 {
 			goodMatches++
 		}
 	}
-
 	if goodMatches < 2 {
 		t.Errorf("Expected multiple good matches in periodic data, found only %d", goodMatches)
 	}
 }
 
 func TestMASSV2_NumericalStability(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
+	t.Parallel()
 
-	// Test with various scales to check numerical stability
-	scales := []float64{1e-5, 1e-3, 1, 1e3, 1e5}
+	scales := []float64{1e-200, 1e-8, 1e-5, 1e-3, 1, 1e3, 1e5, 1e200}
 
 	for _, scale := range scales {
 		t.Run(fmt.Sprintf("Scale_%e", scale), func(t *testing.T) {
+			t.Parallel()
+
+			// GIVEN the same shape at a given scale.
 			baseData := []float64{-1, 1, 4, 5, 6, 6, 8, 12, 20, 36}
 			timeSeries := make([]float64, len(baseData))
 			for i, v := range baseData {
@@ -329,12 +343,13 @@ func TestMASSV2_NumericalStability(t *testing.T) {
 			}
 			query := []float64{3 * scale, 4 * scale, 5 * scale}
 
-			distances, err := MASSV2(timeSeries, query)
+			// WHEN the public distance-profile API is called.
+			distances, err := massv2.MASSV2(timeSeries, query)
 			if err != nil {
 				t.Fatalf("MASSV2 failed at scale %e: %v", scale, err)
 			}
 
-			// Find the minimum distance (should be at index 2)
+			// THEN the exact occurrence at index 2 is the minimum and is zero.
 			minIdx := 0
 			minDist := distances[0]
 			for i, dist := range distances {
@@ -343,79 +358,146 @@ func TestMASSV2_NumericalStability(t *testing.T) {
 					minIdx = i
 				}
 			}
-
 			if minIdx != 2 {
 				t.Errorf("At scale %e: expected perfect match at index 2, got index %d", scale, minIdx)
 			}
-
-			if minDist > floatToleranceForMASSV2Test {
+			if !testutil.AlmostEqual(minDist, 0, distanceProfileTestTolerance) {
 				t.Errorf("At scale %e: perfect match distance %.12e should be close to 0", scale, minDist)
 			}
 		})
 	}
 }
 
-// Performance test to verify O(n log n) complexity
-func TestMASSV2_TimeComplexity(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping time complexity test in short mode")
+func TestMASSV2_IndependentlyScaledInputs_PreserveNormalizedDistance(t *testing.T) {
+	t.Parallel()
+
+	// GIVEN independently scaled, nonconstant inputs with the same shape.
+	timeSeries := []float64{1, 2, 4}
+	query := []float64{1e-8, 2e-8, 4e-8}
+
+	// WHEN the public distance-profile API is called.
+	actualDistances, err := massv2.MASSV2(timeSeries, query)
+
+	// THEN the nonconstant query is accepted and its normalized distance is zero.
+	testutil.AssertDistanceProfilesEqual(t, actualDistances, []float64{0}, err, distanceProfileTestTolerance)
+}
+
+func TestMASSV2_ExtremeFiniteValues_MatchExactProfile(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name       string
+		timeSeries []float64
+		query      []float64
+	}{
+		{
+			name:       "large offset exact match",
+			timeSeries: []float64{10_000_001, 10_000_002, 10_000_004},
+			query:      []float64{10_000_001, 10_000_002, 10_000_004},
+		},
+		{
+			name:       "very large offset exact match",
+			timeSeries: []float64{1_000_000_001, 1_000_000_002, 1_000_000_004},
+			query:      []float64{1_000_000_001, 1_000_000_002, 1_000_000_004},
+		},
+		{
+			name:       "large offset nonmatch is not a perfect match",
+			timeSeries: []float64{100_000_002, 100_000_001, 100_000_004},
+			query:      []float64{100_000_001, 100_000_002, 100_000_004},
+		},
+		{
+			name:       "large finite magnitude exact match",
+			timeSeries: []float64{1e200, 2e200, 4e200},
+			query:      []float64{1, 2, 4},
+		},
+		{
+			name:       "anticorrelated shape has maximum distance",
+			timeSeries: []float64{1, 2, 4},
+			query:      []float64{-1, -2, -4},
+		},
+		{
+			name:       "window after large outlier remains accurate",
+			timeSeries: []float64{1e9, 1, 2, 4, 8},
+			query:      []float64{1, 2, 4},
+		},
+		{
+			name:       "two element large offset exact match",
+			timeSeries: []float64{134_217_727, 134_217_729},
+			query:      []float64{-1, 1},
+		},
+		{
+			name:       "adjacent values near maximum float remain distinct",
+			timeSeries: []float64{math.Nextafter(math.MaxFloat64, 0), math.MaxFloat64},
+			query:      []float64{-1, 1},
+		},
+		{
+			name:       "opposite sign extremes whose difference overflows",
+			timeSeries: []float64{math.MaxFloat64, -math.MaxFloat64, 0, 1},
+			query:      []float64{1, -1, 0},
+		},
+		{
+			name:       "opposite sign extremes with ordinary values between",
+			timeSeries: []float64{-math.MaxFloat64, 0, math.MaxFloat64},
+			query:      []float64{-1, 0, 1},
+		},
+		{
+			name:       "subnormal values",
+			timeSeries: []float64{5e-324, 1e-323, 2e-323, 1.5e-323},
+			query:      []float64{1, 2, 4},
+		},
+		{
+			name:       "extreme value next to ordinary values",
+			timeSeries: []float64{math.MaxFloat64, 1, 2, 4, 8},
+			query:      []float64{1, 2, 4},
+		},
 	}
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
 
-	// Test different sizes to verify O(n log n) complexity
-	sizes := []int{1000, 2000, 4000, 8000}
-	queryLength := 50
-	times := make([]time.Duration, len(sizes))
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 
-	for i, n := range sizes {
-		timeSeries := generateSyntheticData(n, 12345)
-		query := generateSyntheticData(queryLength, 54321)
+			// GIVEN an exact profile that cannot overflow or underflow.
+			expectedDistances := testutil.ExactDistanceProfile(testCase.timeSeries, testCase.query)
 
-		start := time.Now()
-		_, err := MASSV2(timeSeries, query)
-		elapsed := time.Since(start)
+			// WHEN the public distance-profile API is called.
+			actualDistances, err := massv2.MASSV2(testCase.timeSeries, testCase.query)
 
-		if err != nil {
-			t.Fatalf("MASSV2 failed for size %d: %v", n, err)
-		}
-
-		times[i] = elapsed
-		t.Logf("Size %d: %v", n, elapsed)
+			// THEN every distance agrees with the exact profile.
+			testutil.AssertDistanceProfilesEqual(t, actualDistances, expectedDistances, err, distanceProfileTestTolerance)
+		})
 	}
+}
 
-	// Verify that execution time grows sub-quadratically
-	// For O(n log n), doubling input size should roughly double time (plus log factor)
-	for i := 1; i < len(sizes); i++ {
-		ratio := float64(times[i]) / float64(times[i-1])
-		sizeRatio := float64(sizes[i]) / float64(sizes[i-1])
-		logRatio := math.Log(float64(sizes[i])) / math.Log(float64(sizes[i-1]))
-		expectedRatio := sizeRatio * logRatio
+func TestMASSV2_LargeDepartingOutlier_MatchesIndependentProfile(t *testing.T) {
+	t.Parallel()
 
-		// Allow for some variance due to system factors
-		if ratio > expectedRatio*3 {
-			t.Errorf("Time complexity appears worse than O(n log n): size ratio %.1f, time ratio %.1f, expected ~%.1f",
-				sizeRatio, ratio, expectedRatio)
-		}
+	// GIVEN a large first observation followed by varied ordinary observations
+	// and an exact query occurrence well after the outlier has departed.
+	timeSeries := testutil.LargeOutlierSeries()
+	query := slices.Clone(timeSeries[500:510])
+	expectedDistances := testutil.OracleDistanceProfile(timeSeries, query)
 
-		t.Logf("Size ratio: %.1f, Time ratio: %.1f, Expected O(n log n) ratio: %.1f",
-			sizeRatio, ratio, expectedRatio)
-	}
+	// WHEN the public distance-profile API is called.
+	actualDistances, err := massv2.MASSV2(timeSeries, query)
+
+	// THEN every window, including those after the outlier, agrees with the oracle.
+	testutil.AssertDistanceProfilesEqual(t, actualDistances, expectedDistances, err, distanceProfileTestTolerance)
 }
 
 // Property-based test using random data
 func TestMASSV2_Properties(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
+	t.Parallel()
 
-	seed := []uint64{defaultSeed0, defaultSeed1}
-	prng := newPRNG(seed...)
+	seed := []uint64{testutil.DefaultSeed0, testutil.DefaultSeed1}
+	prng := testutil.NewPRNG(seed...)
 
 	const numTests = 50
 	for i := range numTests {
 		n := prng.IntN(500) + 100 // 100 to 600
 		m := prng.IntN(n/2) + 3   // 3 to n/2
 
-		timeSeries := generateSyntheticData(n, seed...)
-		query := generateSyntheticData(m, seed[1], seed[0])
+		timeSeries := testutil.GenerateSyntheticData(n, seed...)
+		query := testutil.GenerateSyntheticData(m, seed[1], seed[0])
 
 		// Ensure query has non-zero variance
 		querySigma := stat.StdDev(query, nil)
@@ -423,12 +505,10 @@ func TestMASSV2_Properties(t *testing.T) {
 			continue // Skip this iteration
 		}
 
-		distances, err := MASSV2(timeSeries, query)
+		distances, err := massv2.MASSV2(timeSeries, query)
 		if err != nil {
 			t.Fatalf("MASSV2 failed on iteration %d (n=%d, m=%d): %v", i, n, m, err)
 		}
-
-		// Properties that should always hold:
 
 		// 1. Correct number of distances
 		expectedLength := n - m + 1
@@ -438,8 +518,8 @@ func TestMASSV2_Properties(t *testing.T) {
 
 		// 2. All distances should be non-negative
 		for j, dist := range distances {
-			if dist < 0 && !math.IsInf(dist, 1) {
-				t.Errorf("Iteration %d: distance[%d] = %f should be non-negative", i, j, dist)
+			if math.IsNaN(dist) || math.IsInf(dist, 0) || dist < 0 {
+				t.Errorf("Iteration %d: distance[%d] = %v should be finite and nonnegative", i, j, dist)
 			}
 		}
 
@@ -451,296 +531,38 @@ func TestMASSV2_Properties(t *testing.T) {
 			copy(testSeries[insertPos:insertPos+m], query)
 			copy(testSeries[insertPos+m:], timeSeries[insertPos+m:])
 
-			selfDistances, err := MASSV2(testSeries, query)
-			if err != nil {
-				continue // Skip if this fails due to numerical issues
+			selfDistances, selfMatchErr := massv2.MASSV2(testSeries, query)
+			if selfMatchErr != nil {
+				t.Fatalf("MASSV2 self-match failed on iteration %d (n=%d, m=%d): %v", i, n, m, selfMatchErr)
 			}
 
-			if len(selfDistances) > insertPos && selfDistances[insertPos] > floatToleranceForMASSV2Test {
+			if len(selfDistances) != expectedLength {
+				t.Fatalf("Iteration %d: expected %d self-match distances, got %d", i, expectedLength, len(selfDistances))
+			}
+			if !testutil.AlmostEqual(selfDistances[insertPos], 0, distanceProfileTestTolerance) {
 				t.Errorf("Iteration %d: self-match distance %f should be close to 0", i, selfDistances[insertPos])
 			}
 		}
 	}
 }
 
-func TestFFTConvolutionLinear(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
+// assertAllPublicOperationsFail checks that every public operation returns
+// the expected error for the given inputs and no successful result.
+func assertAllPublicOperationsFail(t *testing.T, timeSeries, query []float64, expectedErr error) {
+	t.Helper()
 
-	type TestCase struct {
-		Name                string
-		InputSignal         []float64
-		InputKernel         []float64
-		ExpectedDotProducts []float64
-		ExpectedError       error
+	distances, err := massv2.MASSV2(timeSeries, query)
+	if !errors.Is(err, expectedErr) || distances != nil {
+		t.Errorf("MASSV2: expected error %v and nil profile, got %v and %v", expectedErr, err, distances)
 	}
 
-	testCases := []TestCase{
-		{
-			Name:                "basic functionality",
-			InputSignal:         []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-			InputKernel:         []float64{5, 4, 3},
-			ExpectedDotProducts: []float64{5, 14, 26, 38, 50, 62, 74, 86, 98, 110, 67, 30},
-		},
-		{
-			Name:          "empty signal should return error",
-			InputSignal:   []float64{},
-			InputKernel:   []float64{5, 4, 3},
-			ExpectedError: errEmptyFFTConvolutionInputs,
-		},
-		{
-			Name:          "nil signal should return error",
-			InputSignal:   nil,
-			InputKernel:   []float64{5, 4, 3},
-			ExpectedError: errEmptyFFTConvolutionInputs,
-		},
-		{
-			Name:          "empty kernel should return error",
-			InputSignal:   []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-			InputKernel:   []float64{},
-			ExpectedError: errEmptyFFTConvolutionInputs,
-		},
-		{
-			Name:          "nil signal should return error",
-			InputSignal:   []float64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10},
-			InputKernel:   nil,
-			ExpectedError: errEmptyFFTConvolutionInputs,
-		},
+	index, dist, err := massv2.FindBestMatch(timeSeries, query)
+	if !errors.Is(err, expectedErr) || index != -1 {
+		t.Errorf("FindBestMatch: expected error %v and index -1, got %v, index %d, distance %v", expectedErr, err, index, dist)
 	}
 
-	for _, tc := range testCases {
-		t.Run(tc.Name, func(t *testing.T) {
-			// WHEN (operation under test)
-			actualDotProducts, err := fftConvolutionLinear(tc.InputSignal, tc.InputKernel)
-
-			// THEN (assertions)
-
-			if err != nil && tc.ExpectedError == nil {
-				t.Fatalf("fftConvolutionLinear failed: %v", err)
-			}
-
-			// When an error is expected, assert that we received it
-			if tc.ExpectedError != nil {
-				if !errors.Is(err, tc.ExpectedError) {
-					t.Errorf("expected error %v, got %v", tc.ExpectedError, err)
-				}
-
-				// Since we expected an error, do not evaluate the dot
-				// products.
-				return
-			}
-
-			if len(actualDotProducts) != len(tc.ExpectedDotProducts) {
-				t.Fatalf("expected returned slice to have length %d, got length %d", len(tc.ExpectedDotProducts), len(actualDotProducts))
-			}
-
-			for i, expected := range tc.ExpectedDotProducts {
-				actual := actualDotProducts[i]
-				if !almostEqual(actual, expected, floatTolerance) {
-					t.Errorf("expected returned slice index %d to be %f, got %f", i, expected, actual)
-				}
-			}
-		})
+	indices, distances, err := massv2.FindTopKMatches(timeSeries, query, 2)
+	if !errors.Is(err, expectedErr) || indices != nil || distances != nil {
+		t.Errorf("FindTopKMatches: expected error %v and nil results, got %v, %v, %v", expectedErr, err, indices, distances)
 	}
-}
-
-// Test helper functions
-func TestSlidingMeanStddev(t *testing.T) {
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
-
-	type TestCase struct {
-		Name            string
-		InputData       []float64
-		InputWindowSize int
-		ExpectedMeans   []float64
-		ExpectedSigmas  []float64
-	}
-
-	testCases := []TestCase{
-		{
-			Name:            "basic functionality",
-			InputData:       []float64{1, 2, 4, 8, 16},
-			InputWindowSize: 3,
-			ExpectedMeans:   []float64{2.3333333333, 4.6666666667, 9.3333333333}, // [1,2,4], [2,4,8], [4,8,16]
-			ExpectedSigmas:  []float64{1.2472191289, 2.4944382578, 4.9888765157}, // [1,2,4], [2,4,8], [4,8,16]
-		},
-		{
-			Name:            "empty or nil values when windowSize > len(data)",
-			InputData:       []float64{1, 2, 4, 8, 16, 32},
-			InputWindowSize: 7, // len(data) + 1
-			ExpectedMeans:   nil,
-			ExpectedSigmas:  nil,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.Name, func(t *testing.T) {
-			// WHEN (operation under test)
-			actualMeans, actualSigmas := slidingMeanStddev(tc.InputData, tc.InputWindowSize)
-
-			// THEN (assertions
-
-			if len(actualMeans) != len(tc.ExpectedMeans) {
-				t.Errorf("expected %d sliding means, got %d", len(tc.ExpectedMeans), len(actualMeans))
-			}
-			for i, expected := range tc.ExpectedMeans {
-				if !almostEqual(actualMeans[i], expected, floatTolerance) {
-					t.Errorf("expected sliding mean at %d to be %f, got %f", i, expected, actualMeans[i])
-				}
-			}
-
-			if len(actualSigmas) != len(tc.ExpectedSigmas) {
-				t.Errorf("expected %d sliding means, got %d", len(tc.ExpectedSigmas), len(actualSigmas))
-			}
-			for i, expected := range tc.ExpectedSigmas {
-				if !almostEqual(actualSigmas[i], expected, floatTolerance) {
-					t.Errorf("expected sliding mean at %d to be %f, got %f", i, expected, actualSigmas[i])
-				}
-			}
-		})
-	}
-}
-
-// `go test -short ./...` to skip this test
-func TestSlidingMeanStddev_FloatingPointAccumulationError(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping floating point accumulation error test in short mode")
-	}
-	t.Parallel() // this test is stateless and can be run in parallel with other tests
-
-	// GIVEN (set up)
-
-	const (
-		m = 60 * 24 // 1 day of observations @ 1-minute intervals
-
-		// Generate a time-series with ~5.27 million values, which is enough to
-		// hold 10 years of observations taken every minute.
-		n = 60 * 24 * 366 * 10
-	)
-
-	// Create time-series
-	seed := []uint64{defaultSeed0, defaultSeed1}
-	prng := newPRNG(seed...)
-	ts := generateNoisySineWave(n, 97, 100, 0, seed...)
-
-	// Pick a subsequence of the time-series for the query
-	queryIdx := prng.IntN(n - m)
-	query := make([]float64, m)
-	copy(query, ts[queryIdx:queryIdx+m])
-
-	expectedMeans, expectedSigmas := naiveSlidingMeanStddev(ts, m)
-
-	// WHEN (operation under test)
-
-	actualMeans, actualSigmas := slidingMeanStddev(ts, m)
-
-	// THEN (assertions)
-
-	if len(actualMeans) != len(expectedMeans) {
-		t.Fatalf("expected sliding means to have length %d, got %d", len(expectedMeans), len(actualMeans))
-	}
-	if len(actualSigmas) != len(expectedSigmas) {
-		t.Fatalf("expected sliding standard deviations to have length %d, got %d", len(expectedSigmas), len(actualSigmas))
-	}
-
-	lastIndex := len(actualMeans) - 1
-
-	lastActualMean := actualMeans[lastIndex]
-	lastExpectedMean := expectedMeans[lastIndex]
-	if !almostEqual(lastActualMean, lastExpectedMean, floatToleranceForMASSV2Test) {
-		t.Errorf("last actual mean and the last expected mean differ by excessive margin: %e [seed: %v]", math.Abs(lastActualMean-lastExpectedMean), seed)
-	}
-
-	lastActualStddev := actualSigmas[lastIndex]
-	lastExpectedStddev := expectedSigmas[lastIndex]
-	if !almostEqual(lastActualStddev, lastExpectedStddev, floatToleranceForMASSV2Test) {
-		t.Errorf("last actual standard deviation and the last expected standard deviation differ by excessive margin: %e [seed: %v]", math.Abs(lastActualStddev-lastExpectedStddev), seed)
-	}
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// HELPER FUNCTIONS
-
-// almostEqual is a helper function to check if two float64 values are equal,
-// allowing for a little tolerance due to floating point accumulation errors.
-func almostEqual(a, b, tolerance float64) bool {
-	return math.Abs(a-b) <= tolerance
-}
-
-// generateNoisySineWave is a helper function to generate sinusoidal data with
-// noise up to +-10% of amplitude.
-func generateNoisySineWave(n int, frequency, amplitude, phase float64, seed ...uint64) []float64 {
-	noiseMax := math.Abs(amplitude) * 0.1
-	noiseStddev := noiseMax * 0.333
-
-	prng := newPRNG(seed...)
-	data := make([]float64, n)
-	for i := range data {
-		data[i] = amplitude * math.Sin(2*math.Pi*frequency*float64(i)/float64(n)+phase)
-
-		noise := prng.NormFloat64() * noiseStddev
-		if math.Abs(noise) <= noiseMax {
-			data[i] += noise
-		}
-	}
-
-	return data
-}
-
-// generateSineWave is a helper function to generate sinusoidal data.
-func generateSineWave(n int, frequency, amplitude, phase float64) []float64 {
-	data := make([]float64, n)
-	for i := range data {
-		data[i] = amplitude * math.Sin(2*math.Pi*frequency*float64(i)/float64(n)+phase)
-	}
-	return data
-}
-
-// generateSyntheticData is a helper function to generate synthetic time-series
-// data.
-func generateSyntheticData(n int, seed ...uint64) []float64 {
-	prng := newPRNG(seed...)
-	data := make([]float64, n)
-	for i := range data {
-		data[i] = prng.NormFloat64()
-	}
-	return data
-}
-
-// naiveSlidingMeanStddev computes the mean and standard deviation of every
-// sliding window in data size windowSize by recomputing the entire content
-// of each window. This approach avoids floating-point accumulation error.
-//
-// This function exists for testing the output of slidingMeanStddev and
-// fine-tuning its algorithm to maximize efficiency while minimizing
-// computational overhead.
-func naiveSlidingMeanStddev(data []float64, windowSize int) (means, sigmas []float64) {
-	n := len(data)
-	if windowSize > n {
-		return nil, nil
-	}
-
-	means = make([]float64, n-windowSize+1)
-	sigmas = make([]float64, n-windowSize+1)
-
-	// Slide the window and recompute the mean and standard deviation from
-	// scratch for each window.
-	for i := 0; i <= n-windowSize; i++ {
-		means[i], sigmas[i] = stat.PopMeanStdDev(data[i:i+windowSize], nil)
-	}
-
-	return means, sigmas
-}
-
-func newPRNG(seed ...uint64) *rand.Rand {
-	seed0 := defaultSeed0
-	seed1 := defaultSeed1
-	if len(seed) > 0 {
-		seed0 = seed[0]
-		if len(seed) > 1 {
-			seed1 = seed[1]
-		}
-	}
-
-	src := rand.NewPCG(seed0, seed1)
-	return rand.New(src)
 }

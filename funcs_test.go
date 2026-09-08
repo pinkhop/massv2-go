@@ -1,13 +1,77 @@
-package massv2
+package massv2_test
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"slices"
 	"testing"
+
+	massv2 "github.com/pinkhop/massv2-go"
+	"github.com/pinkhop/massv2-go/internal/testutil"
 )
 
-const floatToleranceForFuncsTest = 2e-6
+// floatToleranceForFuncsTest bounds disagreement with expected selected
+// distances. It independently pins the documented target for these fixtures.
+const floatToleranceForFuncsTest = 1e-7
+
+func TestFindBestMatch_ConstantSeries_ReturnsErrNoFiniteMatch(t *testing.T) {
+	t.Parallel()
+
+	for _, series := range [][]float64{{2, 2}, {2, 2, 2, 2, 2}} {
+		t.Run(fmt.Sprintf("length=%d", len(series)), func(t *testing.T) {
+			t.Parallel()
+			// GIVEN a nonconstant query and only constant candidate windows.
+			query := []float64{1, 2}
+
+			// WHEN the best match is requested.
+			index, distance, err := massv2.FindBestMatch(series, query)
+
+			// THEN the error identifies the absence of a finite match.
+			if !errors.Is(err, massv2.ErrNoFiniteMatch) {
+				t.Errorf("expected ErrNoFiniteMatch, got %v", err)
+			}
+			if index != -1 || distance != -1 {
+				t.Errorf("expected error results (-1, -1), got (%d, %v)", index, distance)
+			}
+		})
+	}
+}
+
+func TestFindTopKMatches_ConstantWindows_ReturnsOnlyFiniteMatches(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name      string
+		series    []float64
+		k         int
+		indices   []int
+		distances []float64
+	}{
+		{name: "k below finite count", series: []float64{2, 2, 1, 1, 2, 2}, k: 1, indices: []int{3}, distances: []float64{0}},
+		{name: "k equals finite count", series: []float64{2, 2, 1, 1, 2, 2}, k: 2, indices: []int{3, 1}, distances: []float64{0, 2 * math.Sqrt2}},
+		{name: "k exceeds finite count", series: []float64{2, 2, 1, 1, 2, 2}, k: 4, indices: []int{3, 1}, distances: []float64{0, 2 * math.Sqrt2}},
+		{name: "k exceeds window count", series: []float64{2, 2, 1, 1, 2, 2}, k: 10, indices: []int{3, 1}, distances: []float64{0, 2 * math.Sqrt2}},
+		{name: "all windows constant", series: []float64{2, 2, 2, 2}, k: 2},
+		{name: "single constant window", series: []float64{2, 2}, k: 1},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// GIVEN a nonconstant query and a series containing constant windows.
+			query := []float64{1, 2}
+
+			// WHEN up to k matches are requested.
+			indices, distances, err := massv2.FindTopKMatches(tc.series, query, tc.k)
+
+			// THEN only finite matches remain, ordered by increasing distance.
+			testutil.AssertDistanceProfilesEqual(t, distances, tc.distances, err, floatToleranceForFuncsTest)
+			if !slices.Equal(indices, tc.indices) {
+				t.Errorf("expected indices %v, got %v", tc.indices, indices)
+			}
+		})
+	}
+}
 
 func TestFindBestMatch(t *testing.T) {
 	t.Parallel() // this test is stateless and can be run in parallel with other tests
@@ -47,13 +111,13 @@ func TestFindBestMatch(t *testing.T) {
 			Name:            "error when query longer than time-series",
 			InputTimeSeries: []float64{1, 2, 3},
 			InputQuery:      []float64{1, 2, 3, 4},
-			ExpectedErr:     ErrQueryLongerThanTimeSeries,
+			ExpectedErr:     massv2.ErrQueryLongerThanTimeSeries,
 		},
 		{
 			Name:            "error when query has zero variance",
 			InputTimeSeries: []float64{1, 2, 3, 4, 5},
 			InputQuery:      []float64{2, 2, 2},
-			ExpectedErr:     ErrQueryHasZeroVariance,
+			ExpectedErr:     massv2.ErrQueryHasZeroVariance,
 		},
 	}
 
@@ -62,7 +126,7 @@ func TestFindBestMatch(t *testing.T) {
 			// GIVEN (set up)
 
 			// WHEN (operation under test)
-			actualIndex, actualDistance, actualErr := FindBestMatch(tc.InputTimeSeries, tc.InputQuery)
+			actualIndex, actualDistance, actualErr := massv2.FindBestMatch(tc.InputTimeSeries, tc.InputQuery)
 
 			// THEN (assertions)
 
@@ -91,10 +155,31 @@ func TestFindBestMatch(t *testing.T) {
 			if actualIndex != tc.ExpectedIndex {
 				t.Errorf("expected index %d, got %d", tc.ExpectedIndex, actualIndex)
 			}
-			if math.Abs(actualDistance-tc.ExpectedZNormalizedDistance) > floatToleranceForFuncsTest {
+			if !testutil.AlmostEqual(actualDistance, tc.ExpectedZNormalizedDistance, floatToleranceForFuncsTest) {
 				t.Errorf("expected z-normalized distance %.10e, got %.10e (difference of %.10e)", tc.ExpectedZNormalizedDistance, actualDistance, math.Abs(actualDistance-tc.ExpectedZNormalizedDistance))
 			}
 		})
+	}
+}
+
+func TestFindBestMatch_LargeOutlier_DoesNotHideFollowingExactMatch(t *testing.T) {
+	t.Parallel()
+
+	// GIVEN a long series whose first value is much larger than an exact later match.
+	timeSeries := testutil.LargeOutlierSeries()
+	query := slices.Clone(timeSeries[500:510])
+
+	// WHEN the best match is selected from the distance profile.
+	actualIndex, actualDistance, err := massv2.FindBestMatch(timeSeries, query)
+	// THEN the exact match following the outlier is selected.
+	if err != nil {
+		t.Fatalf("FindBestMatch failed: %v", err)
+	}
+	if actualIndex != 500 {
+		t.Errorf("expected index 500, got %d", actualIndex)
+	}
+	if math.IsNaN(actualDistance) || math.IsInf(actualDistance, 0) || !testutil.AlmostEqual(actualDistance, 0, floatToleranceForFuncsTest) {
+		t.Errorf("expected finite zero distance, got %.16g", actualDistance)
 	}
 }
 
@@ -216,28 +301,28 @@ func TestFindTopKMatches(t *testing.T) {
 			InputTimeSeries: []float64{1, 2, 3, 4, 5},
 			InputQuery:      []float64{2, 3},
 			InputK:          0,
-			ExpectedErr:     ErrKMustBePositive,
+			ExpectedErr:     massv2.ErrKMustBePositive,
 		},
 		{
 			Name:            "error when k<0",
 			InputTimeSeries: []float64{1, 2, 3, 4, 5},
 			InputQuery:      []float64{2, 3},
 			InputK:          -1,
-			ExpectedErr:     ErrKMustBePositive,
+			ExpectedErr:     massv2.ErrKMustBePositive,
 		},
 		{
 			Name:            "error when query longer than time-series",
 			InputTimeSeries: []float64{1, 2, 3},
 			InputQuery:      []float64{1, 2, 3, 4},
 			InputK:          1,
-			ExpectedErr:     ErrQueryLongerThanTimeSeries,
+			ExpectedErr:     massv2.ErrQueryLongerThanTimeSeries,
 		},
 		{
 			Name:            "error when query has zero variance",
 			InputTimeSeries: []float64{1, 2, 3, 4, 5},
 			InputQuery:      []float64{2, 2, 2},
 			InputK:          1,
-			ExpectedErr:     ErrQueryHasZeroVariance,
+			ExpectedErr:     massv2.ErrQueryHasZeroVariance,
 		},
 	}
 
@@ -246,7 +331,7 @@ func TestFindTopKMatches(t *testing.T) {
 			// GIVEN (set up)
 
 			// WHEN (operation under test)
-			actualIndices, actualDistances, actualErr := FindTopKMatches(tc.InputTimeSeries, tc.InputQuery, tc.InputK)
+			actualIndices, actualDistances, actualErr := massv2.FindTopKMatches(tc.InputTimeSeries, tc.InputQuery, tc.InputK)
 
 			// THEN (assertions)
 
@@ -291,14 +376,7 @@ func TestFindTopKMatches(t *testing.T) {
 				}
 			}
 
-			for i, expected := range tc.ExpectedZNormalizedDistances {
-				actual := actualDistances[i]
-				if math.Abs(actual-expected) > floatToleranceForFuncsTest {
-					massDistances, _ := MASSV2(tc.InputTimeSeries, tc.InputQuery)
-					t.Logf("MASSV2=%v", massDistances)
-					t.Errorf("expected top k distance at index %d to be %f, got %f (difference of %.10e)", i, expected, actual, math.Abs(actual-expected))
-				}
-			}
+			testutil.AssertDistanceProfilesEqual(t, actualDistances, tc.ExpectedZNormalizedDistances, actualErr, floatToleranceForFuncsTest)
 		})
 	}
 }

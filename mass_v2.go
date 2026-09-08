@@ -28,6 +28,16 @@
 // provides convenience functions to find the best match, or the top K matches,
 // in the time-series.
 //
+// The absolute accuracy target is 1e-7 in z-normalized distance units. The
+// FFT path checks each entry against a forward roundoff bound. Any entry it
+// cannot certify within the target, including exact and near-exact matches,
+// is recalculated directly from the original window. Direct recalculation
+// is expected to meet the target for query lengths up to about one million
+// values, but it does not check an error bound on the returned distance.
+// Longer queries are accepted without guaranteeing the target for directly
+// recalculated distances. The target is not an unconditional guarantee for
+// every finite result; a nil error is not a separate accuracy certification.
+//
 // Citation: Abdullah Mueen, Sheng Zhong, Yan Zhu, Michael Yeh, Kaveh Kamgar,
 // Krishnamurthy Viswanathan, Chetan Kumar Gupta and Eamonn Keogh (2022), The
 // Fastest Similarity Search Algorithm for Time Series Subsequences under
@@ -37,193 +47,107 @@ package massv2
 
 import (
 	"errors"
+	"fmt"
 	"math"
 
-	"gonum.org/v1/gonum/dsp/fourier"
-	"gonum.org/v1/gonum/stat"
+	"github.com/pinkhop/massv2-go/internal/distance"
 )
-
-const floatTolerance = 1e-6
 
 var (
-	ErrEmptyQuery                = errors.New("empty or nil query")
-	ErrEmptyTimeSeries           = errors.New("empty or nil time-series")
-	ErrQueryHasZeroVariance      = errors.New("query has zero variance (all values are the same)")
+	// ErrEmptyQuery is returned when the query is nil or empty.
+	ErrEmptyQuery = errors.New("empty or nil query")
+	// ErrEmptyTimeSeries is returned when the time-series is nil or empty.
+	ErrEmptyTimeSeries = errors.New("empty or nil time-series")
+	// ErrQueryHasZeroVariance is returned when every query value is equal,
+	// so the query has no z-normalized form.
+	ErrQueryHasZeroVariance = errors.New("query has zero variance (all values are the same)")
+	// ErrQueryLongerThanTimeSeries is returned when the query has more
+	// values than the time-series.
 	ErrQueryLongerThanTimeSeries = errors.New("query length exceeds time-series length")
-
-	errEmptyFFTConvolutionInputs = errors.New("empty or nil inputs for FFT convolution")
+	// ErrQueryNotFinite is returned when the query contains NaN or an
+	// infinite value.
+	ErrQueryNotFinite = errors.New("query contains NaN or an infinite value")
+	// ErrTimeSeriesNotFinite is returned when the time-series contains NaN
+	// or an infinite value.
+	ErrTimeSeriesNotFinite = errors.New("time-series contains NaN or an infinite value")
 )
 
-// MASSV2 computes and returns the z-normalized Euclidean distance between the
-// query sequence and every subsequence of the same length in the time-series.
-// The algorithm operates in O(n log n) time with a space complexity of O(n).
+// MASSV2 computes the z-normalized Euclidean distance between the query and
+// every subsequence of the same length in the time-series.
 //
-// The time-series and query sequence must not be empty or nil. The query
-// cannot have zero variance (constant values) or be longer than the
-// time-series. An error is returned when the inputs are invalid.
+// The result has len(timeSeries) − len(query) + 1 entries; entry i is the
+// distance to the window starting at index i. Each window and the query are
+// normalized by their population mean and population standard deviation. A
+// window whose values are all equal has no z-normalized form and receives
+// positive infinity (+Inf), even when the returned error is nil. Callers
+// must check for these entries (for example, with math.IsInf(d, 1)) before
+// using distances in arithmetic or serialization that requires finite values.
+// FindBestMatch and FindTopKMatches select only finite distances.
+//
+// The absolute accuracy target is 1e-7, subject to the direct-recalculation
+// limits described in the package documentation.
+//
+// Time is O(n log n) for the FFT path plus O(m) for each window that the
+// FFT roundoff bound cannot certify. Exact and near-exact matches are always
+// recalculated, as are nonconstant windows whose variation is tiny compared
+// with the series' overall range, so a profile in which every window is such
+// a case costs O(n·m). Constant windows skip statistics rebuilding and direct
+// recalculation after linear equality scans. An entirely constant series
+// skips the FFT and takes O(n+m) time. Space is O(n) beyond the inputs,
+// including one lazily allocated O(m) buffer reused for direct recalculation.
+//
+// The inputs are not modified and may be read concurrently by other calls;
+// the caller must not modify them during the call. Both inputs must be
+// nonempty and finite, the query must not be longer than the time-series, and
+// the query must not be constant; the returned error identifies which
+// condition failed.
 func MASSV2(timeSeries, query []float64) (distances []float64, err error) {
-	n := len(timeSeries)
-	m := len(query)
-
-	// Guard statements
-	if m <= 0 {
-		return nil, ErrEmptyQuery
-	} else if n <= 0 {
-		return nil, ErrEmptyTimeSeries
-	} else if m > n {
-		return nil, ErrQueryLongerThanTimeSeries
+	if err := validateInputs(timeSeries, query); err != nil {
+		return nil, err
 	}
-
-	// Compute query statistics
-	queryMean, querySigma := stat.PopMeanStdDev(query, nil)
-	if querySigma < floatTolerance { // values very close to 0 are treated like 0
-		return nil, ErrQueryHasZeroVariance
+	profile, err := distance.Compute(timeSeries, query)
+	if err != nil {
+		return nil, publicProfileError(err)
 	}
-
-	// Compute sliding window statistics for the time-series
-	timeSeriesMeans, timeSeriesSigmas := slidingMeanStddev(timeSeries, m)
-
-	// Prepare the query for convolution: reverse the query
-	reversedQuery := make([]float64, m)
-	for i := range m {
-		reversedQuery[i] = query[m-1-i]
-	}
-
-	// Compute the dot products using linear FFT convolution. We know that
-	// timeSeries and reversedQuery cannot be empty due to the checks we
-	// performed above, so we do not need to check the error.
-	dotProducts, _ := fftConvolutionLinear(timeSeries, reversedQuery)
-
-	// Compute z-normalized Euclidean distances
-	distances = make([]float64, n-m+1)
-	for i := 0; i < len(distances); i++ {
-		if timeSeriesSigmas[i] == 0 {
-			distances[i] = math.Inf(1) // infinite distance for zero variance subsequences
-			continue
-		}
-
-		// Apply z-normalized Euclidean distance formula.
-		//
-		// In the reference MATLAB implementation (which uses 1-based arrays),
-		// the computation is:
-		//     dist = 2*(m-(z(m:n)-m*meanx(m:n)*meany)./(sigmax(m:n)*sigmay));
-		//     dist = sqrt(dist);
-		normalizedDot := (dotProducts[m+i-1] - float64(m)*timeSeriesMeans[i]*queryMean) / (timeSeriesSigmas[i] * querySigma) // = m * rho
-		distSquared := 2.0 * (float64(m) - normalizedDot)
-		if distSquared < 0 {
-			distSquared = 0
-		}
-		distances[i] = math.Sqrt(distSquared)
-	}
-
-	return distances, nil
+	return profile.Distances, nil
 }
 
-// fftConvolutionLinear performs linear convolution of 'signal' (len n)
-// with 'kernel' (effective len m), using FFT zero-padding. Returns an error
-// when signal or kernel are empty or nil.
-func fftConvolutionLinear(signal, kernel []float64) ([]float64, error) {
-	n := len(signal)
-	m := len(kernel)
-	if n == 0 || m == 0 {
-		return nil, errEmptyFFTConvolutionInputs
+// validateInputs checks the structural and finiteness preconditions of
+// MASSV2 and returns the first violated one as its exported error.
+func validateInputs(timeSeries, query []float64) error {
+	switch {
+	case len(query) == 0:
+		return ErrEmptyQuery
+	case len(timeSeries) == 0:
+		return ErrEmptyTimeSeries
+	case len(query) > len(timeSeries):
+		return ErrQueryLongerThanTimeSeries
+	case !allFinite(query):
+		return ErrQueryNotFinite
+	case !allFinite(timeSeries):
+		return ErrTimeSeriesNotFinite
 	}
-
-	convLen := nextPow2(n + m - 1)
-
-	fft := fourier.NewCmplxFFT(convLen)
-
-	a := make([]complex128, convLen)
-	b := make([]complex128, convLen)
-
-	for i := range n {
-		a[i] = complex(signal[i], 0)
-	}
-	for i := range m {
-		b[i] = complex(kernel[i], 0)
-	}
-
-	A := fft.Coefficients(nil, a)
-	B := fft.Coefficients(nil, b)
-
-	for i := range convLen {
-		A[i] *= B[i]
-	}
-
-	c := fft.Sequence(nil, A)
-
-	out := make([]float64, n+m-1)
-	scale := float64(convLen) // gonum FFT is unnormalized
-	for i := range out {
-		out[i] = real(c[i]) / scale
-	}
-	return out, nil
+	return nil
 }
 
-// nextPow2 returns the smallest power of two >= x
-func nextPow2(x int) int {
-	p := 1
-	for p < x {
-		p <<= 1
-	}
-	return p
-}
-
-// slidingMeanStddev computes the mean and standard deviation of every sliding
-// window in data of size windowSize.
-func slidingMeanStddev(data []float64, windowSize int) (means, sigmas []float64) {
-	n := len(data)
-	if windowSize > n {
-		return nil, nil
-	}
-
-	means = make([]float64, n-windowSize+1)
-	sigmas = make([]float64, n-windowSize+1)
-	windowSizeF64 := float64(windowSize)
-
-	// Initialize the first window
-	var sum, sumOfSquares float64
-	for i := range windowSize {
-		sum += data[i]
-		sumOfSquares += data[i] * data[i]
-	}
-	means[0] = sum / windowSizeF64
-	variance := sumOfSquares/windowSizeF64 - means[0]*means[0]
-	if variance < 0 { // handle floating point imprecision, prevent sqrt of negative value
-		variance = 0
-	}
-	sigmas[0] = math.Sqrt(variance)
-
-	// Slide the window and update mean and standard deviations incrementally
-	for i := 1; i <= n-windowSize; i++ {
-		// NOTE: Testing finds that there is not significant floating point
-		// accumulation error due to the incremental updates to sum and
-		// sumOfSquares for the lengths of time-series and queries an order of
-		// magnitude greater than I am interested in evaluating, so this
-		// algorithm does not attempt to limit floating point accumulation
-		// error. If this is determined to be an issue at a future point, an
-		// easy solution would be to fully recompute sum and sumOfSquares for
-		// one out of every 100,000 (or 1 million, or whatever); e.g.,
-		// if i%100_000 == 0.
-
-		// Remove the element leaving the window
-		oldValue := data[i-1]
-		sum -= oldValue
-		sumOfSquares -= oldValue * oldValue
-
-		// Add the element entering the window
-		newValue := data[i+windowSize-1]
-		sum += newValue
-		sumOfSquares += newValue * newValue
-
-		// Compute the mean and standard deviation for the updated window
-		means[i] = sum / windowSizeF64
-		variance = sumOfSquares/windowSizeF64 - means[i]*means[i]
-		if variance < 0 { // handle floating point imprecision, prevent sqrt of negative value
-			variance = 0
+// allFinite reports whether no value is NaN or infinite.
+func allFinite(values []float64) bool {
+	for _, value := range values {
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return false
 		}
-		sigmas[i] = math.Sqrt(variance)
 	}
+	return true
+}
 
-	return means, sigmas
+// publicProfileError maps an error from the internal profile computation to
+// the exported error that describes it, so callers can match with errors.Is
+// without depending on internal sentinels. A constant query is the only
+// failure the computation reports for validated inputs; anything else is
+// wrapped so that it is never dropped.
+func publicProfileError(err error) error {
+	if errors.Is(err, distance.ErrConstantQuery) {
+		return ErrQueryHasZeroVariance
+	}
+	return fmt.Errorf("computing distance profile: %w", err)
 }
